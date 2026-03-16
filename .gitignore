@@ -1,0 +1,8 @@
+*.pem
+*.txt
+venv/
+__pycache__/
+*.pem
+*.txt
+venv/
+__pycache__/
