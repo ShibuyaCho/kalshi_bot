@@ -1,5 +1,5 @@
 KALSHI_API_KEY = "badfebbf-0b3b-4e1f-aabe-ee19fbe46c46"
-KALSHI_PRIVATE_KEY_PATH = "/home/jackson/kelshi_bot/kalshi-key.txt"
+KALSHI_PRIVATE_KEY_PATH = "/home/jackson/kalshi_bot/kalshi-key.txt"
 SCAN_INTERVAL = 10
 LIQUIDITY_THRESHOLD = 50
 EDGE_THRESHOLD = 3
