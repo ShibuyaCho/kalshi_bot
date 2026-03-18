@@ -1,27 +1,4 @@
-from kalshi_client import KalshiClient
-import config
+import trade_bot
 
-client = KalshiClient()
-
-print("Fetching markets...")
-
-markets = client.get_markets()
-
-if "markets" not in markets:
-    print("API error:", markets)
-    exit()
-
-ticker = markets["markets"][0]["ticker"]
-
-print("Testing order on market:", ticker)
-
-price = 50  # midpoint price
-
-result = client.place_order(
-    ticker,
-    price,
-    config.TEST_ORDER_SIZE
-)
-
-print("Order response:")
-print(result)
+if __name__ == "__main__":
+    trade_bot.run()

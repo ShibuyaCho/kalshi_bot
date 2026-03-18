@@ -7,16 +7,13 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.backends import default_backend
 import config
 
-
 def load_private_key(path: str):
     with open(path, "rb") as f:
         return serialization.load_pem_private_key(
             f.read(), password=None, backend=default_backend()
         )
 
-
 def sign_pss(private_key, timestamp: str, method: str, path: str) -> str:
-    # Must sign the full path including /trade-api/v2 prefix
     path_without_query = path.split("?")[0]
     message = f"{timestamp}{method}{path_without_query}".encode("utf-8")
     signature = private_key.sign(
@@ -29,25 +26,22 @@ def sign_pss(private_key, timestamp: str, method: str, path: str) -> str:
     )
     return base64.b64encode(signature).decode("utf-8")
 
-
 class KalshiClient:
     def __init__(self):
-        self.api_key = config.KALSHI_API_KEY
+        self.api_key     = config.KALSHI_API_KEY
         self.private_key = load_private_key(config.KALSHI_PRIVATE_KEY_PATH)
-        self.base_url = "https://api.elections.kalshi.com"
-        self.base_path = "/trade-api/v2"
+        self.base_url    = "https://api.elections.kalshi.com"
+        self.base_path   = "/trade-api/v2"
 
     def _headers(self, method: str, path: str) -> dict:
-        # path here is e.g. /portfolio/balance
-        # We sign the full path: /trade-api/v2/portfolio/balance
         full_path = self.base_path + path
-        ts = str(int(datetime.datetime.now().timestamp() * 1000))
+        ts  = str(int(datetime.datetime.now().timestamp() * 1000))
         sig = sign_pss(self.private_key, ts, method, full_path)
         return {
-            "Content-Type": "application/json",
-            "KALSHI-ACCESS-KEY": self.api_key,
-            "KALSHI-ACCESS-SIGNATURE": sig,
-            "KALSHI-ACCESS-TIMESTAMP": ts,
+            "Content-Type":              "application/json",
+            "KALSHI-ACCESS-KEY":         self.api_key,
+            "KALSHI-ACCESS-SIGNATURE":   sig,
+            "KALSHI-ACCESS-TIMESTAMP":   ts,
         }
 
     def _get(self, path: str):
@@ -80,14 +74,12 @@ class KalshiClient:
         data = self._get("/portfolio/balance")
         if not data:
             return 0.0, 0.0
-        balance_cents = data.get("balance", 0)
-        portfolio_cents = data.get("portfolio_value", 0)
-        return balance_cents / 100, portfolio_cents / 100
+        return data.get("balance", 0) / 100, data.get("portfolio_value", 0) / 100
 
     def get_markets(self):
         all_markets = []
         cursor = None
-        page = 0
+        page   = 0
         while True:
             page += 1
             path = "/markets?limit=100"
@@ -96,12 +88,10 @@ class KalshiClient:
             data = self._get(path)
             if not data:
                 break
-            batch = data.get("markets", [])
+            batch  = data.get("markets", [])
             all_markets.extend(batch)
             cursor = data.get("cursor")
-            if not cursor:
-                break
-            if page >= 20:
+            if not cursor or page >= 20:
                 break
         print("TOTAL MARKETS FETCHED:", len(all_markets))
         return all_markets
@@ -119,17 +109,17 @@ class KalshiClient:
             return [[float(e[0]), float(e[1])] for e in side]
         return {
             "yes": parse_side(ob.get("yes_dollars_fp", [])),
-            "no":  parse_side(ob.get("no_dollars_fp", []))
+            "no":  parse_side(ob.get("no_dollars_fp",  [])),
         }
 
     def place_order(self, ticker: str, side: str, price_cents: int, count: int):
         payload = {
-            "ticker": ticker,
-            "side": side,
-            "type": "limit",
+            "ticker":    ticker,
+            "side":      side,
+            "type":      "limit",
             "yes_price": price_cents if side == "yes" else 100 - price_cents,
-            "count": count,
-            "action": "buy",
+            "count":     count,
+            "action":    "buy",
             "time_in_force": "fill_or_kill",
         }
         return self._post("/portfolio/orders", payload)
