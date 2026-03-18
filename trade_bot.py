@@ -15,6 +15,8 @@ import config
 import feed
 import strategy
 import odds_client
+import dip_strategy
+import positions
 from kalshi_client import KalshiClient
 from datetime import datetime
 
@@ -27,6 +29,7 @@ MARKET_REFRESH_INTERVAL = 60 * 30  # refresh market list every 30 min
 
 consensus_probs: dict = {}
 last_odds_refresh: float = 0
+last_dip_scan: float = 0
 
 # Per-ticker cooldown: track last trade time to avoid hammering the same market
 last_traded: dict = {}
@@ -280,13 +283,93 @@ def execute_odds(opp: dict):
     last_traded[ticker] = time.time()
 
 
+def execute_dip(opp: dict):
+    """Buy a dip and register the position for time-based exit tracking."""
+    ticker = opp["ticker"]
+    if not _cooldown_ok(ticker):
+        print(f"  Skipping {ticker} — in cooldown.")
+        return
+
+    # Don't re-enter a position we're already holding
+    open_pos = positions.get_open_positions()
+    if ticker in open_pos:
+        return
+
+    side          = opp["side"]
+    price_dollars = opp["yes_price_dollars"] if side == "yes" else opp["no_price_dollars"]
+    price_cents   = round(price_dollars * 100)
+
+    count = get_order_size(price_dollars)
+    if count == 0:
+        return
+
+    print(f"  {opp['action']} {ticker} @ {price_cents}c x{count}  ({opp['matchup']})")
+    result = client.place_order(ticker, side, price_cents, count)
+    print(f"  Result: {result}")
+
+    if result:
+        positions.open_position(
+            ticker        = ticker,
+            side          = side,
+            entry_cents   = price_cents,
+            count         = count,
+            commence_time = opp.get("commence_time"),
+            fair_value_cents = opp["fair_value_cents"],
+        )
+        last_traded[ticker] = time.time()
+
+
+def check_position_exits():
+    """
+    Check all open dip positions and sell any that have hit their
+    profit target, stop loss, or time-based exit trigger.
+    """
+    open_pos = positions.get_open_positions()
+    if not open_pos:
+        return
+
+    for ticker, pos in list(open_pos.items()):
+        snapshot = get_snapshot(ticker)
+        if not snapshot:
+            continue
+
+        side = pos["side"]
+        current_cents = (snapshot["yes_price"] if side == "yes" else snapshot["no_price"]) * 100
+
+        exit_now, reason = positions.should_exit(ticker, current_cents)
+        if not exit_now:
+            continue
+
+        print(f"EXIT [{datetime.now().strftime('%H:%M:%S')}] {reason}")
+
+        if config.TRADING_ENABLED:
+            # Sell by buying the opposite side
+            sell_side   = "no"  if side == "yes" else "yes"
+            sell_cents  = round((1.0 - (current_cents / 100)) * 100)
+            sell_dollars = sell_cents / 100
+            count = pos["count"]
+            print(f"  Selling: {sell_side.upper()} @ {sell_cents}c x{count}")
+            result = client.place_order(ticker, sell_side, sell_cents, count)
+            print(f"  Result: {result}")
+
+        positions.close_position(ticker)
+
+
 # ── Main scan loop ─────────────────────────────────────────────────────────────
 
 def scan_and_trade(ws):
+    global last_dip_scan
+
     refresh_markets_if_needed(ws)
     refresh_odds_if_needed()
 
-    arb_hits = odds_hits = 0
+    arb_hits = odds_hits = dip_hits = 0
+
+    # Always check exits first so we don't miss time-based sells
+    check_position_exits()
+
+    # Dip scans are rate-limited since they call news + odds APIs
+    run_dip_scan = (time.time() - last_dip_scan) >= config.DIP_SCAN_INTERVAL
 
     for ticker in liquid_markets:
         snapshot = get_snapshot(ticker)
@@ -311,9 +394,24 @@ def scan_and_trade(ws):
             if config.TRADING_ENABLED:
                 execute_odds(odds_opp)
 
+        # 3. Dip strategy (rate-limited, sports markets only)
+        if run_dip_scan:
+            dip_opp = dip_strategy.evaluate_dip(ticker, snapshot, consensus_probs)
+            if dip_opp:
+                dip_hits += 1
+                ts = datetime.now().strftime("%H:%M:%S")
+                print(f"OPPORTUNITY [{ts}] {dip_opp['reason']}")
+                if config.TRADING_ENABLED:
+                    execute_dip(dip_opp)
+
+    if run_dip_scan:
+        last_dip_scan = time.time()
+
+    open_count = len(positions.get_open_positions())
     print(
         f"--- Scan done: {len(liquid_markets)} markets | "
-        f"{arb_hits} arb opps | {odds_hits} odds opps ---"
+        f"{arb_hits} arb | {odds_hits} odds | {dip_hits} dip | "
+        f"{open_count} open positions ---"
     )
 
 
@@ -329,7 +427,9 @@ def run():
         print("*** DRY RUN MODE — no orders will be placed ***")
 
     if config.ODDS_API_KEY == "YOUR_ODDS_API_KEY_HERE":
-        print("NOTE: ODDS_API_KEY not set in config.py — odds strategy disabled.")
+        print("NOTE: ODDS_API_KEY not set in config.py — odds + dip strategies disabled.")
+    if config.NEWS_API_KEY == "YOUR_NEWS_API_KEY_HERE":
+        print("NOTE: NEWS_API_KEY not set in config.py — news sentiment disabled (dip strategy will use odds only).")
 
     while True:
         try:
