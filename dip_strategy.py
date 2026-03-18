@@ -13,6 +13,9 @@ def evaluate_dip(ticker, snapshot, consensus_probs):
         return None
     if snapshot["liquidity"] < MIN_LIQUIDITY:
         return None
+    # Skip markets where price is at floor/ceiling (game already decided)
+    if snapshot["yes_price"] <= 0.02 or snapshot["yes_price"] >= 0.98:
+        return None
     parsed = market_parser.parse_ticker(ticker)
     if not parsed:
         return None

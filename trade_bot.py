@@ -97,6 +97,15 @@ def discover_active_markets() -> list:
         no_bid  = float(m.get("no_bid_dollars")  or 0)
         if yes_bid <= 0.01 and no_bid <= 0.01:
             continue
+        # Skip markets that opened more than 4 hours ago (game likely in progress or done)
+        open_time_str = m.get("open_time")
+        if open_time_str:
+            try:
+                ot = datetime.fromisoformat(open_time_str.replace("Z", "+00:00"))
+                if ot < now - timedelta(hours=4):
+                    continue
+            except Exception:
+                pass
         tickers.append(ticker)
     print(f"Active markets with real liquidity: {len(tickers)}")
     return tickers
