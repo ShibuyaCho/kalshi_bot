@@ -9,19 +9,14 @@ import config
 
 def load_private_key(path: str):
     with open(path, "rb") as f:
-        return serialization.load_pem_private_key(
-            f.read(), password=None, backend=default_backend()
-        )
+        return serialization.load_pem_private_key(f.read(), password=None, backend=default_backend())
 
 def sign_pss(private_key, timestamp: str, method: str, path: str) -> str:
     path_without_query = path.split("?")[0]
     message = f"{timestamp}{method}{path_without_query}".encode("utf-8")
     signature = private_key.sign(
         message,
-        padding.PSS(
-            mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.DIGEST_LENGTH
-        ),
+        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
         hashes.SHA256()
     )
     return base64.b64encode(signature).decode("utf-8")
@@ -38,10 +33,10 @@ class KalshiClient:
         ts  = str(int(datetime.datetime.now().timestamp() * 1000))
         sig = sign_pss(self.private_key, ts, method, full_path)
         return {
-            "Content-Type":              "application/json",
-            "KALSHI-ACCESS-KEY":         self.api_key,
-            "KALSHI-ACCESS-SIGNATURE":   sig,
-            "KALSHI-ACCESS-TIMESTAMP":   ts,
+            "Content-Type":            "application/json",
+            "KALSHI-ACCESS-KEY":       self.api_key,
+            "KALSHI-ACCESS-SIGNATURE": sig,
+            "KALSHI-ACCESS-TIMESTAMP": ts,
         }
 
     def _get(self, path: str):
@@ -57,13 +52,20 @@ class KalshiClient:
 
     def _post(self, path: str, payload: dict):
         url = self.base_url + self.base_path + path
-        r = requests.post(
-            url,
-            headers=self._headers("POST", path),
-            data=json.dumps(payload)
-        )
+        r = requests.post(url, headers=self._headers("POST", path), data=json.dumps(payload))
         if r.status_code not in (200, 201):
             print(f"POST ERROR {r.status_code}: {r.text}")
+            return None
+        try:
+            return r.json()
+        except Exception:
+            return None
+
+    def _delete(self, path: str):
+        url = self.base_url + self.base_path + path
+        r = requests.delete(url, headers=self._headers("DELETE", path))
+        if r.status_code not in (200, 204):
+            print(f"DELETE ERROR {r.status_code}: {r.text}")
             return None
         try:
             return r.json()
@@ -78,21 +80,29 @@ class KalshiClient:
 
     def get_markets(self):
         all_markets = []
-        cursor = None
-        page   = 0
-        while True:
-            page += 1
-            path = "/markets?limit=100"
-            if cursor:
-                path += f"&cursor={cursor}"
-            data = self._get(path)
-            if not data:
-                break
-            batch  = data.get("markets", [])
-            all_markets.extend(batch)
-            cursor = data.get("cursor")
-            if not cursor or page >= 20:
-                break
+        # Query sports game series directly to avoid KXMV parlay flood
+        series_list = [
+            "KXNBAGAME", "KXNHLGAME", "KXMLBGAME", "KXNFLGAME",
+            "KXNCAABGAME", "KXNCAAWBGAME", "KXNCAAMB1HWINNER",
+            "KXNBASPREAD", "KXNHLSPREAD", "KXMLBSPREAD",
+            "KXNBATOTAL", "KXNHLTOTAL", "KXNBA1HTOTAL",
+        ]
+        for series in series_list:
+            cursor = None
+            page   = 0
+            while True:
+                page += 1
+                path = f"/markets?limit=100&series_ticker={series}"
+                if cursor:
+                    path += f"&cursor={cursor}"
+                data = self._get(path)
+                if not data:
+                    break
+                batch  = data.get("markets", [])
+                all_markets.extend(batch)
+                cursor = data.get("cursor")
+                if not cursor or page >= 5:
+                    break
         print("TOTAL MARKETS FETCHED:", len(all_markets))
         return all_markets
 
@@ -113,6 +123,18 @@ class KalshiClient:
         }
 
     def place_order(self, ticker: str, side: str, price_cents: int, count: int):
+        # Always fetch live ask price so order fills immediately
+        market = self._get(f"/markets/{ticker}")
+        if market and market.get("market"):
+            m = market["market"]
+            if side == "yes":
+                ask = m.get("yes_ask_dollars")
+                if ask:
+                    price_cents = round(float(ask) * 100)
+            else:
+                ask = m.get("no_ask_dollars")
+                if ask:
+                    price_cents = round(float(ask) * 100)
         payload = {
             "ticker":    ticker,
             "side":      side,
@@ -120,6 +142,5 @@ class KalshiClient:
             "yes_price": price_cents if side == "yes" else 100 - price_cents,
             "count":     count,
             "action":    "buy",
-            "time_in_force": "fill_or_kill",
         }
         return self._post("/portfolio/orders", payload)

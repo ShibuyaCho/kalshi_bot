@@ -1,135 +1,144 @@
 """
 trade_bot.py
-Main trading loop. Runs two strategies in parallel:
-
-  1. Arb strategy   — scans ALL liquid Kalshi markets for order-book
-                      mispricing (YES + NO ≠ 100). Pure Kalshi data.
-
-  2. Odds strategy  — scans sports markets (NBA/NFL/MLB/NHL) and compares
-                      Kalshi YES prices against consensus sportsbook odds.
-                      Trades when Kalshi is mispriced vs external fair value.
+- Fetches ALL markets, filters out KXMV parlays + stub prices + games >24h away
+- One trade per market per day (daily_trades.json)
+- Max 3 open positions
+- Dip strategy: buy when Kalshi < Vegas odds by DIP_THRESHOLD_CENTS
+- Exit: sell on any profit, hold losers to game resolution
 """
-
 import time
+import json
+import os
 import config
 import feed
-import strategy
-import odds_client
 import dip_strategy
+import odds_client
 import positions
 from kalshi_client import KalshiClient
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 client = KalshiClient()
 
-# ── State ──────────────────────────────────────────────────────────────────────
-liquid_markets: list = []
-last_market_refresh: float = 0
-MARKET_REFRESH_INTERVAL = 60 * 30  # refresh market list every 30 min
+liquid_markets:     list  = []
+last_market_refresh:float = 0
+MARKET_REFRESH_INTERVAL   = 60 * 30
 
-consensus_probs: dict = {}
-last_odds_refresh: float = 0
-last_dip_scan: float = 0
+consensus_probs:    dict  = {}
+last_odds_refresh:  float = 0
+last_dip_scan:      float = 0
 
-# Per-ticker cooldown: track last trade time to avoid hammering the same market
-last_traded: dict = {}
-TRADE_COOLDOWN = 120  # seconds before we trade the same ticker again
+DAILY_TRADES_FILE  = os.path.join(os.path.dirname(__file__), "daily_trades.json")
+MAX_OPEN_POSITIONS = 3
 
+# ── Daily trade log ────────────────────────────────────────────────────────────
+def _load_daily_trades() -> dict:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        if os.path.exists(DAILY_TRADES_FILE):
+            data = json.load(open(DAILY_TRADES_FILE))
+            if data.get("date") == today:
+                return data.get("trades", {})
+    except Exception:
+        pass
+    return {}
+
+def _save_daily_trades(trades: dict):
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    json.dump({"date": today, "trades": trades}, open(DAILY_TRADES_FILE, "w"))
+
+def already_traded_today(ticker: str) -> bool:
+    return ticker in _load_daily_trades()
+
+def mark_traded_today(ticker: str):
+    trades = _load_daily_trades()
+    trades[ticker] = datetime.now(timezone.utc).isoformat()
+    _save_daily_trades(trades)
+    print(f"  [daily] {ticker} marked — skip for rest of day.")
 
 # ── Sizing ─────────────────────────────────────────────────────────────────────
-
 def get_order_size(price_dollars: float) -> int:
     balance, _ = client.get_balance()
-    if balance <= 0:
-        print("  No balance available, skipping.")
+    if balance < config.MIN_BALANCE_DOLLARS:
+        print(f"  Balance ${balance:.2f} below minimum, skipping.")
         return 0
-
-    max_dollars = min(
-        balance * config.MAX_POSITION_PCT,
-        config.MAX_ORDER_DOLLARS,
-    )
-
+    max_dollars = min(balance * config.MAX_POSITION_PCT, config.MAX_ORDER_DOLLARS)
     if max_dollars < config.MIN_ORDER_DOLLARS:
-        print(f"  Balance too low for minimum order (${balance:.2f} available).")
+        print(f"  Balance too low for min order.")
         return 0
-
     contracts = max(1, int(max_dollars / price_dollars))
-    print(f"  Balance: ${balance:.2f} | Sizing {contracts} contracts at ${price_dollars:.2f} each")
+    print(f"  Balance: ${balance:.2f} | {contracts} contracts @ ${price_dollars:.2f}")
     return contracts
 
-
 # ── Market discovery ───────────────────────────────────────────────────────────
-
 def discover_active_markets() -> list:
     print("Fetching active markets...")
-    raw = client.get_markets()
+    raw    = client.get_markets()
+    now    = datetime.now(timezone.utc)
+    cutoff = now + timedelta(hours=24)
     tickers = []
     for m in raw:
-        ticker = m.get("ticker")
+        ticker = m.get("ticker", "")
         if not ticker or m.get("status") != "active":
             continue
-        yes_bid  = float(m.get("yes_bid_dollars") or 0)
-        no_bid   = float(m.get("no_bid_dollars") or 0)
-        yes_ask  = float(m.get("yes_ask_dollars") or 0)
-        no_ask   = float(m.get("no_ask_dollars") or 0)
-        if (yes_bid > 0 and yes_ask > 0) or (no_bid > 0 and no_ask > 0):
-            tickers.append(ticker)
-    print(f"Liquid active markets: {len(tickers)}")
+        # Skip KXMV multi-leg parlays
+        if ticker.startswith("KXMV"):
+            continue
+        # Skip games more than 24 hours away
+        open_time = m.get("open_time") or m.get("close_time")
+        if open_time:
+            try:
+                ot = datetime.fromisoformat(open_time.replace("Z", "+00:00"))
+                if ot > cutoff:
+                    continue
+            except Exception:
+                pass
+        # Skip stub/unopened markets
+        yes_bid = float(m.get("yes_bid_dollars") or 0)
+        no_bid  = float(m.get("no_bid_dollars")  or 0)
+        if yes_bid <= 0.01 and no_bid <= 0.01:
+            continue
+        tickers.append(ticker)
+    print(f"Active markets with real liquidity: {len(tickers)}")
     return tickers
-
 
 def refresh_markets_if_needed(ws):
     global liquid_markets, last_market_refresh
-    now = time.time()
-    if now - last_market_refresh < MARKET_REFRESH_INTERVAL:
+    if time.time() - last_market_refresh < MARKET_REFRESH_INTERVAL:
         return
-
     print("Refreshing market list...")
     new_tickers = discover_active_markets()
-    current_set = set(liquid_markets)
-    new_set     = set(new_tickers)
-
-    added   = new_set - current_set
-    removed = current_set - new_set
-
+    added   = set(new_tickers) - set(liquid_markets)
+    removed = set(liquid_markets) - set(new_tickers)
     if added:
-        print(f"  {len(added)} new markets, subscribing...")
         feed.subscribe(ws, list(added))
+        print(f"  +{len(added)} new markets subscribed.")
     if removed:
-        print(f"  {len(removed)} markets removed.")
-
-    liquid_markets     = new_tickers
-    last_market_refresh = now
-
+        print(f"  -{len(removed)} markets removed.")
+    liquid_markets      = new_tickers
+    last_market_refresh = time.time()
 
 # ── Odds refresh ───────────────────────────────────────────────────────────────
-
 def refresh_odds_if_needed():
     global consensus_probs, last_odds_refresh
-    now = time.time()
-    if now - last_odds_refresh < config.ODDS_SCAN_INTERVAL:
+    if time.time() - last_odds_refresh < config.ODDS_SCAN_INTERVAL:
         return
     if config.ODDS_API_KEY == "YOUR_ODDS_API_KEY_HERE":
-        return  # not configured, skip silently
+        return
     print("Refreshing external odds...")
     try:
         consensus_probs = odds_client.get_all_consensus_probs()
-        print(f"  {len(consensus_probs)} matchups loaded from sportsbooks.")
+        print(f"  {len(consensus_probs)} matchups loaded.")
     except Exception as e:
         print(f"  Odds refresh failed: {e}")
-    last_odds_refresh = now
+    last_odds_refresh = time.time()
 
-
-# ── Snapshot helpers ───────────────────────────────────────────────────────────
-
+# ── Snapshot ───────────────────────────────────────────────────────────────────
 def get_snapshot(ticker: str):
     book = feed.get_live_book(ticker)
     if not book:
         return None
-
     yes = book.get("yes")
     no  = book.get("no")
-
     try:
         yes_price = float(yes[0][0]) if yes else None
         yes_size  = float(yes[0][1]) if yes else 0
@@ -137,334 +146,128 @@ def get_snapshot(ticker: str):
         no_size   = float(no[0][1])  if no  else 0
     except (IndexError, TypeError, ValueError):
         return None
-
     if yes_price is None and no_price is not None:
         yes_price = 1.0 - no_price
     if no_price is None and yes_price is not None:
         no_price = 1.0 - yes_price
     if yes_price is None or no_price is None:
         return None
-
     return {
-        "ticker":    ticker,
-        "yes_price": yes_price,
-        "no_price":  no_price,
-        "yes_size":  yes_size,
-        "no_size":   no_size,
-        "liquidity": yes_size + no_size,
+        "ticker": ticker, "yes_price": yes_price, "no_price": no_price,
+        "yes_size": yes_size, "no_size": no_size, "liquidity": yes_size + no_size,
     }
 
-
-# ── Arb evaluation (order-book gap / overhang) ─────────────────────────────────
-
-def evaluate_arb(snapshot) -> dict | None:
-    if not snapshot:
-        return None
-
-    yes_cents = snapshot["yes_price"] * 100
-    no_cents  = snapshot["no_price"]  * 100
-    implied   = yes_cents + no_cents
-
-    if yes_cents < 2 or yes_cents > 98:
-        return None
-    if no_cents  < 2 or no_cents  > 98:
-        return None
-    if snapshot["liquidity"] < config.LIQUIDITY_THRESHOLD:
-        return None
-
-    if implied < 100 - config.EDGE_THRESHOLD:
-        return {
-            "ticker":           snapshot["ticker"],
-            "type":             "gap",
-            "yes_price":        round(yes_cents),
-            "no_price":         round(no_cents),
-            "yes_price_dollars": snapshot["yes_price"],
-            "no_price_dollars":  snapshot["no_price"],
-            "implied_sum":      round(implied, 1),
-            "profit_per_contract": round(100 - implied, 1),
-            "reason": f"[ARB-GAP] YES+NO={implied:.1f} < 100, profit {100-implied:.1f}c/contract",
-            "source": "arb",
-        }
-
-    if implied > 100 + config.EDGE_THRESHOLD:
-        return {
-            "ticker":           snapshot["ticker"],
-            "type":             "overhang",
-            "yes_price":        round(yes_cents),
-            "no_price":         round(no_cents),
-            "yes_price_dollars": snapshot["yes_price"],
-            "no_price_dollars":  snapshot["no_price"],
-            "implied_sum":      round(implied, 1),
-            "profit_per_contract": round(implied - 100, 1),
-            "reason": f"[ARB-OVH] YES+NO={implied:.1f} > 100, profit {implied-100:.1f}c/contract",
-            "source": "arb",
-        }
-
-    return None
-
-
-# ── Odds evaluation ────────────────────────────────────────────────────────────
-
-def evaluate_odds(snapshot) -> dict | None:
-    if not snapshot or not consensus_probs:
-        return None
-    if snapshot["liquidity"] < config.LIQUIDITY_THRESHOLD:
-        return None
-
-    yes_cents = snapshot["yes_price"] * 100
-    sig = strategy.odds_signal(snapshot["ticker"], yes_cents, consensus_probs)
-    if not sig:
-        return None
-
-    # Attach pricing info needed by execute
-    sig["yes_price_dollars"] = snapshot["yes_price"]
-    sig["no_price_dollars"]  = snapshot["no_price"]
-    sig["source"] = "odds"
-    return sig
-
-
 # ── Execution ──────────────────────────────────────────────────────────────────
-
-def _cooldown_ok(ticker: str) -> bool:
-    last = last_traded.get(ticker, 0)
-    return (time.time() - last) >= TRADE_COOLDOWN
-
-
-def execute_arb(opp: dict):
-    ticker = opp["ticker"]
-    if not _cooldown_ok(ticker):
-        print(f"  Skipping {ticker} — in cooldown.")
-        return
-
-    if opp["type"] == "gap":
-        count = get_order_size(max(opp["yes_price_dollars"], opp["no_price_dollars"]))
-        if count == 0:
-            return
-        print(f"  Buying YES@{opp['yes_price']}c + NO@{opp['no_price']}c x{count}")
-        yes_r = client.place_order(ticker, "yes", opp["yes_price"], count)
-        no_r  = client.place_order(ticker, "no",  opp["no_price"],  count)
-        print(f"  YES: {yes_r}")
-        print(f"  NO:  {no_r}")
-
-    elif opp["type"] == "overhang":
-        count = get_order_size(max(opp["yes_price_dollars"], opp["no_price_dollars"]))
-        if count == 0:
-            return
-        # Sell YES by buying NO at implied complement, and vice versa
-        sell_yes_as_no = 100 - opp["yes_price"]
-        sell_no_as_yes = 100 - opp["no_price"]
-        print(f"  Selling: buy NO@{sell_yes_as_no}c + buy YES@{sell_no_as_yes}c x{count}")
-        r1 = client.place_order(ticker, "no",  sell_yes_as_no, count)
-        r2 = client.place_order(ticker, "yes", sell_no_as_yes, count)
-        print(f"  r1: {r1}")
-        print(f"  r2: {r2}")
-
-    last_traded[ticker] = time.time()
-
-
-def execute_odds(opp: dict):
-    ticker = opp["ticker"]
-    if not _cooldown_ok(ticker):
-        print(f"  Skipping {ticker} — in cooldown.")
-        return
-
-    action = opp["action"]  # "BUY_YES" or "BUY_NO"
-    side   = "yes" if action == "BUY_YES" else "no"
-    price_dollars = opp["yes_price_dollars"] if side == "yes" else opp["no_price_dollars"]
-    price_cents   = round(price_dollars * 100)
-
-    count = get_order_size(price_dollars)
-    if count == 0:
-        return
-
-    print(f"  {action} {ticker} @ {price_cents}c x{count}  ({opp['matchup']})")
-    result = client.place_order(ticker, side, price_cents, count)
-    print(f"  Result: {result}")
-    last_traded[ticker] = time.time()
-
-
 def execute_dip(opp: dict):
-    """Buy a dip and register the position for time-based exit tracking."""
     ticker = opp["ticker"]
-    if not _cooldown_ok(ticker):
-        print(f"  Skipping {ticker} — in cooldown.")
+    if already_traded_today(ticker):
         return
-
-    # Don't re-enter a position we're already holding
     open_pos = positions.get_open_positions()
+    if len(open_pos) >= MAX_OPEN_POSITIONS:
+        print(f"  Max positions open — skipping {ticker}")
+        return
     if ticker in open_pos:
         return
-
     side          = opp["side"]
     price_dollars = opp["yes_price_dollars"] if side == "yes" else opp["no_price_dollars"]
     price_cents   = round(price_dollars * 100)
-
     count = get_order_size(price_dollars)
     if count == 0:
         return
-
-    print(f"  {opp['action']} {ticker} @ {price_cents}c x{count}  ({opp['matchup']})")
+    print(f"  {opp['action']} {ticker} @ {price_cents}c x{count} ({opp['matchup']})")
     result = client.place_order(ticker, side, price_cents, count)
     print(f"  Result: {result}")
-
     if result:
         positions.open_position(
-            ticker        = ticker,
-            side          = side,
-            entry_cents   = price_cents,
-            count         = count,
-            commence_time = opp.get("commence_time"),
-            fair_value_cents = opp["fair_value_cents"],
+            ticker=ticker, side=side, entry_cents=price_cents,
+            count=count, commence_time=opp.get("commence_time"),
+            fair_value_cents=opp["fair_value_cents"],
         )
-        last_traded[ticker] = time.time()
-
+        mark_traded_today(ticker)
 
 def check_position_exits():
-    """
-    Check all open dip positions and sell any that have hit their
-    profit target, stop loss, or time-based exit trigger.
-    """
     open_pos = positions.get_open_positions()
     if not open_pos:
         return
-
     for ticker, pos in list(open_pos.items()):
         snapshot = get_snapshot(ticker)
         if not snapshot:
             continue
-
-        side = pos["side"]
+        side          = pos["side"]
         current_cents = (snapshot["yes_price"] if side == "yes" else snapshot["no_price"]) * 100
-
         exit_now, reason = positions.should_exit(ticker, current_cents)
         if not exit_now:
             continue
-
         print(f"EXIT [{datetime.now().strftime('%H:%M:%S')}] {reason}")
-
         if config.TRADING_ENABLED:
-            # Sell by buying the opposite side
-            sell_side   = "no"  if side == "yes" else "yes"
-            sell_cents  = round((1.0 - (current_cents / 100)) * 100)
-            sell_dollars = sell_cents / 100
-            count = pos["count"]
-            print(f"  Selling: {sell_side.upper()} @ {sell_cents}c x{count}")
-            result = client.place_order(ticker, sell_side, sell_cents, count)
+            sell_side    = "no" if side == "yes" else "yes"
+            sell_dollars = snapshot["no_price"] if sell_side == "no" else snapshot["yes_price"]
+            sell_cents   = round(sell_dollars * 100)
+            print(f"  Selling {sell_side.upper()} @ {sell_cents}c x{pos['count']}")
+            result = client.place_order(ticker, sell_side, sell_cents, pos["count"])
             print(f"  Result: {result}")
-
         positions.close_position(ticker)
 
-
 # ── Main scan loop ─────────────────────────────────────────────────────────────
-
 def scan_and_trade(ws):
     global last_dip_scan
-
     refresh_markets_if_needed(ws)
     refresh_odds_if_needed()
-
-    arb_hits = odds_hits = dip_hits = 0
-
-    # Always check exits first so we don't miss time-based sells
     check_position_exits()
-
-    # Dip scans are rate-limited since they call news + odds APIs
-    run_dip_scan = (time.time() - last_dip_scan) >= config.DIP_SCAN_INTERVAL
-
+    run_dip = (time.time() - last_dip_scan) >= config.DIP_SCAN_INTERVAL
+    dip_hits = 0
     for ticker in liquid_markets:
         snapshot = get_snapshot(ticker)
         if not snapshot:
             continue
-
-        # 1. Arb strategy (always runs)
-        arb_opp = evaluate_arb(snapshot)
-        if arb_opp:
-            arb_hits += 1
-            ts = datetime.now().strftime("%H:%M:%S")
-            print(f"OPPORTUNITY [{ts}] {arb_opp['reason']} on {ticker}")
-            if config.TRADING_ENABLED:
-                execute_arb(arb_opp)
-
-        # 2. Odds strategy (runs when odds API is configured)
-        odds_opp = evaluate_odds(snapshot)
-        if odds_opp:
-            odds_hits += 1
-            ts = datetime.now().strftime("%H:%M:%S")
-            print(f"OPPORTUNITY [{ts}] {odds_opp['reason']} on {ticker}")
-            if config.TRADING_ENABLED:
-                execute_odds(odds_opp)
-
-        # 3. Dip strategy (rate-limited, sports markets only)
-        if run_dip_scan:
-            dip_opp = dip_strategy.evaluate_dip(ticker, snapshot, consensus_probs)
-            if dip_opp:
+        if run_dip:
+            opp = dip_strategy.evaluate_dip(ticker, snapshot, consensus_probs)
+            if opp:
                 dip_hits += 1
-                ts = datetime.now().strftime("%H:%M:%S")
-                print(f"OPPORTUNITY [{ts}] {dip_opp['reason']}")
+                print(f"OPPORTUNITY [{datetime.now().strftime('%H:%M:%S')}] {opp['reason']}")
                 if config.TRADING_ENABLED:
-                    execute_dip(dip_opp)
-
-    if run_dip_scan:
+                    execute_dip(opp)
+    if run_dip:
         last_dip_scan = time.time()
-
     open_count = len(positions.get_open_positions())
-    print(
-        f"--- Scan done: {len(liquid_markets)} markets | "
-        f"{arb_hits} arb | {odds_hits} odds | {dip_hits} dip | "
-        f"{open_count} open positions ---"
-    )
-
+    print(f"--- Scan: {len(liquid_markets)} markets | {dip_hits} dip opps | {open_count}/{MAX_OPEN_POSITIONS} positions ---")
 
 # ── Entry point ────────────────────────────────────────────────────────────────
-
 def run():
     global liquid_markets, last_market_refresh
-
     balance, portfolio = client.get_balance()
-    print(f"Account balance: ${balance:.2f} | Portfolio value: ${portfolio:.2f}")
-
+    print(f"Balance: ${balance:.2f} | Portfolio: ${portfolio:.2f}")
     if not config.TRADING_ENABLED:
-        print("*** DRY RUN MODE — no orders will be placed ***")
-
+        print("*** DRY RUN — no orders placed ***")
     if config.ODDS_API_KEY == "YOUR_ODDS_API_KEY_HERE":
-        print("NOTE: ODDS_API_KEY not set in config.py — odds + dip strategies disabled.")
-    if config.NEWS_API_KEY == "YOUR_NEWS_API_KEY_HERE":
-        print("NOTE: NEWS_API_KEY not set in config.py — news sentiment disabled (dip strategy will use odds only).")
-
+        print("NOTE: Set ODDS_API_KEY in config.py to enable dip strategy.")
     while True:
         try:
             liquid_markets      = discover_active_markets()
             last_market_refresh = time.time()
-
             if not liquid_markets:
-                print("No liquid markets found, retrying in 60s...")
+                print("No markets found, retrying in 60s...")
                 time.sleep(60)
                 continue
-
-            print(f"Subscribing to {len(liquid_markets)} markets via WebSocket...")
+            print(f"Subscribing to {len(liquid_markets)} markets...")
             ws = feed.start(tickers=liquid_markets, daemon=True)
             time.sleep(5)
-
-            print("Waiting for WebSocket snapshots...")
             for _ in range(30):
                 populated = sum(1 for t in liquid_markets if feed.get_live_book(t))
-                print(f"  {populated}/{len(liquid_markets)} order books received...")
+                print(f"  {populated}/{len(liquid_markets)} books received...")
                 if populated >= len(liquid_markets) * 0.5:
                     break
                 time.sleep(2)
-
             print("Starting scan loop.")
             while True:
                 scan_and_trade(ws)
                 time.sleep(config.SCAN_INTERVAL)
-
         except KeyboardInterrupt:
-            print("Stopped by user.")
+            print("Stopped.")
             break
         except Exception as e:
             print(f"ERROR: {e} — restarting in 30s...")
             time.sleep(30)
-
 
 if __name__ == "__main__":
     run()

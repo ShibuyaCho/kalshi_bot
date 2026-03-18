@@ -29,16 +29,11 @@ def build_headers():
 
 def subscribe(ws, tickers: list):
     if not tickers:
-        print("No tickers to subscribe to.")
         return
     for i, ticker in enumerate(tickers):
         ws.send(json.dumps({
-            "id":  i + 1,
-            "cmd": "subscribe",
-            "params": {
-                "channels":     ["orderbook_delta"],
-                "market_ticker": ticker,
-            },
+            "id": i + 1, "cmd": "subscribe",
+            "params": {"channels": ["orderbook_delta"], "market_ticker": ticker},
         }))
     print(f"Subscribed to {len(tickers)} tickers.")
 
@@ -50,10 +45,8 @@ def on_message(ws, message):
         data = json.loads(message)
     except Exception:
         return
-
     msg_type = data.get("type")
     msg      = data.get("msg", {})
-
     if msg_type == "orderbook_snapshot":
         ticker = msg.get("market_ticker")
         if not ticker:
@@ -67,8 +60,6 @@ def on_message(ws, message):
                 "yes": parse_side(msg.get("yes_dollars_fp", [])),
                 "no":  parse_side(msg.get("no_dollars_fp",  [])),
             }
-        _print_top(ticker)
-
     elif msg_type == "orderbook_delta":
         ticker = msg.get("market_ticker")
         side   = msg.get("side")
@@ -95,20 +86,8 @@ def on_message(ws, message):
                 if delta > 0:
                     book_side.append([price, delta])
                     book_side.sort(key=lambda x: -x[0])
-        _print_top(ticker)
-
     elif msg_type == "error":
-        print("WS error msg:", data)
-
-def _print_top(ticker):
-    book = live_books.get(ticker, {})
-    yes  = book.get("yes")
-    no   = book.get("no")
-    print(
-        ticker,
-        "YES:", yes[0][0] if yes else None,
-        "NO:",  no[0][0]  if no  else None,
-    )
+        print("WS error:", data)
 
 def on_error(ws, error):
     print("WS error:", error)

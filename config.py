@@ -3,10 +3,10 @@ KALSHI_API_KEY          = "badfebbf-0b3b-4e1f-aabe-ee19fbe46c46"   # ⚠ rotate 
 KALSHI_PRIVATE_KEY_PATH = "/home/jackson/kalshi_bot/kalshi-key.txt"
 
 # ── The Odds API ───────────────────────────────────────────────────────────────
-ODDS_API_KEY = "YOUR_ODDS_API_KEY_HERE"     # https://the-odds-api.com (free tier)
+ODDS_API_KEY = "763034a35b625a99239ba1ac8d3a7db4"     # https://the-odds-api.com (free tier)
 
 # ── NewsAPI ────────────────────────────────────────────────────────────────────
-NEWS_API_KEY = "YOUR_NEWS_API_KEY_HERE"     # https://newsapi.org (free tier)
+NEWS_API_KEY = "8ed7a52bda254fe381a32317186e42a9"     # https://newsapi.org (free tier)
 
 # ── Bot behaviour ──────────────────────────────────────────────────────────────
 TRADING_ENABLED     = True      # set False for dry-run / log-only mode
@@ -30,3 +30,4 @@ ORDER_SIZE          = 1
 MAX_POSITION_PCT    = 0.02      # max 2% of balance per trade
 MIN_ORDER_DOLLARS   = 0.05
 MAX_ORDER_DOLLARS   = 2.00
+MIN_BALANCE_DOLLARS = 1.00
